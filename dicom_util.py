@@ -147,27 +147,6 @@ def sort_by_instance_number(images):
     return sorted_images
 
 
-def extract_dicom_data(images):
-    dicom_3d_array = []
-    slice_position = []
-    for i in range(0, len(images)):
-        dicom_3d_array.append(images[i].pixel_array)
-        slice_position.append(images[i].ImagePositionPatient)
-
-    dicom_3d_array = np.asarray(dicom_3d_array)
-    dicom_3d_array = np.rot90(dicom_3d_array, k=-1, axes=(2, 1))
-    dicom_3d_array = np.ascontiguousarray(np.transpose(dicom_3d_array, (1, 2, 0)))
-    return (
-        dicom_3d_array,
-        images[0].PixelSpacing,
-        slice_position,
-        images[0].SliceThickness,
-        images[0].ImagePositionPatient,
-        images[0].ImageOrientationPatient,
-        images[0].Columns,
-    )
-
-
 def filter_by_series_uid(images, series_uid):
     """
     Filter a list of DICOM images by their series instance UID

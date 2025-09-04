@@ -24,7 +24,7 @@ SOFTWARE.
 
 import bpy
 import bpy.utils.previews
-from bpy_extras.io_utils import ImportHelper, ExportHelper
+from bpy_extras.io_utils import ImportHelper
 import openvdb as openvdb
 import numpy as np
 from pathlib import Path
@@ -36,22 +36,18 @@ from platipy.dicom.io.rtstruct_to_nifti import transform_point_set_from_dicom_st
 import SimpleITK as sitk
 
 # MedBlend Custom Packages
-from .proton import is_proton_plan, is_rtplan, has_beam_sequence
+from .proton import is_proton_plan
 from .dicom_util import (
     check_dicom_image_type,
     is_dose_file,
     load_dicom_images,
     sort_by_instance_number,
-    extract_dicom_data,
     filter_by_series_uid,
     find_monaco_ct_directory,
 )
 from .node_groups import (
     apply_DICOM_shader,
     apply_proton_spots_geo_nodes,
-    ensure_volume_display_settings,
-    verify_volume_material,
-    optimize_volume_visibility,
     update_dose_material_thresholds,
 )
 from .blender_utils import add_data_fields, create_object
@@ -69,9 +65,7 @@ def get_dicom_spatial_info(ds):
         Dictionary containing spatial metadata
     """
     spatial_info = {
-        "modality": getattr(ds, "Modality", "Unknown"),
         "image_position": getattr(ds, "ImagePositionPatient", None),
-        "image_orientation": getattr(ds, "ImageOrientationPatient", None),
         "pixel_spacing": getattr(ds, "PixelSpacing", None),
         "slice_thickness": getattr(ds, "SliceThickness", None),
         "spacing_between_slices": getattr(ds, "SpacingBetweenSlices", None),
@@ -86,10 +80,6 @@ def get_dicom_spatial_info(ds):
     if spatial_info["image_position"] is not None:
         spatial_info["image_position"] = np.array(
             [float(x) for x in spatial_info["image_position"]]
-        )
-    if spatial_info["image_orientation"] is not None:
-        spatial_info["image_orientation"] = np.array(
-            [float(x) for x in spatial_info["image_orientation"]]
         )
     if spatial_info["pixel_spacing"] is not None:
         spatial_info["pixel_spacing"] = np.array(
@@ -138,7 +128,6 @@ def calculate_volume_coordinates(spatial_info, pixel_array_shape=None):
     x_coords = image_pos[0] + np.arange(columns) * column_spacing
     y_coords = image_pos[1] + np.arange(rows) * row_spacing
 
-    # Z coordinates depend on modality and available information
     z_coords = None
     if grid_offsets is not None:
         # For RTDOSE: Z = image_position[2] + grid_frame_offset
@@ -204,13 +193,6 @@ def create_blender_transform_matrix(coords):
     scale_y = voxel_size_y / 1000.0  # mm to m
     scale_z = abs(voxel_size_z) / 1000.0  # mm to m, ensure positive
 
-    # Create transformation matrix
-    # OpenVDB grid transformation maps voxel indices to world coordinates
-    # For DICOM:
-    #   - X increases left to right
-    #   - Y increases posterior to anterior
-    #   - Z increases inferior to superior
-    # This matches Blender's coordinate system
     transform = np.array(
         [
             [scale_x, 0, 0, 0],
@@ -245,9 +227,9 @@ def calculate_volume_position_blender(coords):
     # Convert DICOM position (mm) to Blender position (meters)
     position = np.array(
         [
-            x_min / 1000.0,  # X: left-right
-            y_min / 1000.0,  # Y: anterior-posterior
-            z_min / 1000.0,  # Z: inferior-superior
+            x_min / 1000.0,
+            y_min / 1000.0,
+            z_min / 1000.0,
         ]
     )
 
@@ -289,7 +271,7 @@ class SNA_PT_MEDBLEND_70A7C(bpy.types.Panel):
         # Only displays the load buttons if the required dependancies are installed
 
         layout.label(text="Images", icon_value=125)
-        op = layout.operator(
+        layout.operator(
             "medblend.load_ct",
             text="Load DICOM Images",
             icon_value=0,
@@ -297,7 +279,7 @@ class SNA_PT_MEDBLEND_70A7C(bpy.types.Panel):
             depress=False,
         )
         layout.label(text="Dose", icon_value=851)
-        op = layout.operator(
+        layout.operator(
             "medblend.load_dose",
             text="Load DICOM Dose",
             icon_value=0,
@@ -305,7 +287,7 @@ class SNA_PT_MEDBLEND_70A7C(bpy.types.Panel):
             depress=False,
         )
         layout.label(text="Structures", icon_value=304)
-        op = layout.operator(
+        layout.operator(
             "medblend.load_structures",
             text="Load DICOM Structures",
             icon_value=0,
@@ -313,7 +295,7 @@ class SNA_PT_MEDBLEND_70A7C(bpy.types.Panel):
             depress=False,
         )
         layout.label(text="Proton Spots", icon_value=653)
-        op = layout.operator(
+        layout.operator(
             "medblend.load_proton",
             text="Load Proton Plan",
             icon_value=0,
@@ -355,17 +337,14 @@ class SNA_OT_Load_Ct_Fc7B9(bpy.types.Operator, ImportHelper):
             # Sort those filtered DICOM CT slices by their instance number using sort_by_instance_number function
             sorted_images = sort_by_instance_number(filtered_images)
 
-            (
-                CT_volume,
-                spacing,
-                slice_position,
-                slice_spacing,
-                image_origin,
-                image_orientation,
-                image_columns,
-            ) = extract_dicom_data(sorted_images)
+            ct_volume = []
+            for i in range(0, len(images)):
+                ct_volume.append(sorted_images[i].pixel_array)
 
-            # NEW: Calculate proper spatial transformation using DICOM spatial utilities
+            ct_volume = np.asarray(ct_volume)
+            ct_volume = np.rot90(ct_volume, k=-1, axes=(2, 1))
+            ct_volume = np.ascontiguousarray(np.transpose(ct_volume, (1, 2, 0)))
+
             print("=== Calculating proper DICOM spatial transformation ===")
 
             # Get spatial info from first dataset
@@ -379,7 +358,7 @@ class SNA_OT_Load_Ct_Fc7B9(bpy.types.Operator, ImportHelper):
                 z_positions.append(z_pos)
 
             # Calculate coordinate system
-            pixel_array_shape = CT_volume.shape
+            pixel_array_shape = ct_volume.shape
             coords = calculate_volume_coordinates(spatial_info, pixel_array_shape)
 
             # Override Z coordinates with actual slice positions
@@ -394,9 +373,9 @@ class SNA_OT_Load_Ct_Fc7B9(bpy.types.Operator, ImportHelper):
             grid = openvdb.FloatGrid()
 
             # Copies image volume from numpy to VDB grid
-            grid.copyFromArray(CT_volume.astype(float))
+            grid.copyFromArray(ct_volume.astype(float))
             print(
-                f"CT Volume dimensions: {CT_volume.shape}; Transformation Matrix: f{transform_matrix}"
+                f"CT Volume dimensions: {ct_volume.shape}; Transformation Matrix: f{transform_matrix}"
             )
 
             # Convert numpy array to OpenVDB-compatible format (4x4 matrix)
@@ -430,19 +409,14 @@ class SNA_OT_Load_Ct_Fc7B9(bpy.types.Operator, ImportHelper):
                     "z_range": coords["z_range"],
                     "image_position": coords["image_position"].tolist(),
                     "pixel_spacing": coords["pixel_spacing"].tolist(),
-                    "modality": spatial_info["modality"],
                 }
 
                 print(f"Set volume position: {volume_position} m")
-                print(f"Stored spatial metadata in volume object")
         else:
             print("No DICOM images loaded")
 
         # Apply material and ensure proper display settings
         apply_DICOM_shader("Image Material")
-        ensure_volume_display_settings()
-        verify_volume_material("Image Material")
-        optimize_volume_visibility()
 
         return {"FINISHED"}
 
@@ -464,28 +438,17 @@ class SNA_OT_Load_Proton_1Dbc6(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         file_name_proton = self.filepath
 
+        import math
+
+        pi_value = math.pi
+        # Read the DICOM file and get the spot positions and weights
+
         dataset = pydicom.dcmread(file_name_proton)
 
         if is_proton_plan(dataset):
             print("File is proton plan")
-            return self._load_proton_plan(dataset)
-        elif is_rtplan(dataset) and has_beam_sequence(dataset):
-            print("File is standard RT plan with beam sequence")
-            return self._load_rtplan(dataset)
         else:
-            print("File is not a supported plan type")
-            show_message_box(
-                "This file is not a supported RT plan type. Please select a proton plan or standard RT plan.",
-                "Unsupported Plan Type",
-                "ERROR",
-            )
-            return {"CANCELLED"}
-
-    def _load_proton_plan(self, dataset):
-        """Load proton plan with IonBeamSequence"""
-        import math
-
-        pi_value = math.pi
+            print("File is not proton plan")
 
         BeamNo = 0
         for beam in dataset.IonBeamSequence:
@@ -569,7 +532,7 @@ class SNA_OT_Load_Proton_1Dbc6(bpy.types.Operator, ImportHelper):
 
             # create object if data was imported
             if len(mesh.vertices) > 0:
-                obj = create_object(mesh, [f"proton_spots{BeamNo}"][0])
+                obj = create_object(mesh, ["proton_spots" + str(BeamNo)][0])
 
             obj.rotation_euler[1] = gantry_angle * pi_value / 180
             obj.location[0] = iso_center[0]
@@ -580,90 +543,6 @@ class SNA_OT_Load_Proton_1Dbc6(bpy.types.Operator, ImportHelper):
             apply_proton_spots_geo_nodes(node_tree_name="Proton_Spots")
 
         # print(np.shape(weights))
-        return {"FINISHED"}
-
-    def _load_rtplan(self, dataset):
-        """Load standard RT plan with BeamSequence (Monaco format)"""
-        import math
-
-        pi_value = math.pi
-
-        print(f"Loading RT Plan: {dataset.get('RTPlanLabel', 'Unknown')}")
-
-        BeamNo = 0
-        for beam in dataset.BeamSequence:
-            print(f"Processing Beam {BeamNo + 1}")
-
-            # Get beam parameters
-            beam_name = beam.get("BeamName", f"Beam_{BeamNo + 1}")
-            beam_type = beam.get("BeamType", "STATIC")
-            treatment_machine = beam.get("TreatmentMachineName", "Unknown")
-
-            # Get control points - RT plans use ControlPointSequence
-            if hasattr(beam, "ControlPointSequence"):
-                control_points = beam.ControlPointSequence
-
-                # Get beam geometry from first control point
-                if len(control_points) > 0:
-                    first_cp = control_points[0]
-                    gantry_angle = float(first_cp.get("GantryAngle", 0))
-                    collimator_angle = float(first_cp.get("BeamLimitingDeviceAngle", 0))
-
-                    # Get isocenter position
-                    iso_center = np.array([0, 0, 0])  # Default if not available
-                    if hasattr(first_cp, "IsocenterPosition"):
-                        iso_center = np.asarray(first_cp.IsocenterPosition) / 1000
-
-                    # Get dose rate if available
-                    dose_rate = first_cp.get("DoseRateSet", 600)  # Default 600 MU/min
-
-                    print(f"  Beam: {beam_name}")
-                    print(f"  Gantry Angle: {gantry_angle}°")
-                    print(f"  Collimator Angle: {collimator_angle}°")
-                    print(f"  Isocenter: {iso_center}")
-                    print(f"  Dose Rate: {dose_rate} MU/min")
-
-                    # Create a simple beam representation
-                    # For now, create an empty object to represent the beam
-                    bpy.ops.object.empty_add(type="SINGLE_ARROW", align="WORLD")
-                    beam_obj = bpy.context.active_object
-                    beam_obj.name = f"RTBeam_{beam_name}_{BeamNo}"
-
-                    # Set beam orientation and position
-                    beam_obj.rotation_euler[1] = (
-                        gantry_angle * pi_value / 180
-                    )  # Gantry rotation
-                    beam_obj.rotation_euler[2] = (
-                        collimator_angle * pi_value / 180
-                    )  # Collimator rotation
-                    beam_obj.location = iso_center
-                    beam_obj.scale = (0.1, 0.1, 0.1)  # Make it smaller
-
-                    # Add custom properties for beam data
-                    beam_obj["beam_name"] = beam_name
-                    beam_obj["beam_type"] = beam_type
-                    beam_obj["treatment_machine"] = treatment_machine
-                    beam_obj["gantry_angle"] = gantry_angle
-                    beam_obj["collimator_angle"] = collimator_angle
-                    beam_obj["dose_rate"] = dose_rate
-
-                    # Get MLC positions if available
-                    if hasattr(first_cp, "BeamLimitingDevicePositionSequence"):
-                        mlc_data = []
-                        for device in first_cp.BeamLimitingDevicePositionSequence:
-                            device_type = device.get(
-                                "RTBeamLimitingDeviceType", "Unknown"
-                            )
-                            if hasattr(device, "LeafJawPositions"):
-                                positions = device.LeafJawPositions
-                                mlc_data.append(
-                                    {"type": device_type, "positions": positions}
-                                )
-                        beam_obj["mlc_data"] = str(mlc_data)  # Store as string
-
-            BeamNo += 1
-
-        print(f"Loaded {BeamNo} beams from RT Plan")
         return {"FINISHED"}
 
 
@@ -727,7 +606,7 @@ class SNA_OT_Load_Dose_7629F(bpy.types.Operator, ImportHelper):
             dose_matrix = np.flipud(dose_matrix)
 
             # Apply DICOM Dose Grid Scaling to get actual dose values in Gy
-            dose_matrix = dose_matrix * dose_grid_scaling + 0.1  # remove the +0.1 later
+            dose_matrix = dose_matrix * dose_grid_scaling
 
             print(f"Raw pixel range: {pixel_data.min()} to {pixel_data.max()}")
             print(
@@ -746,7 +625,7 @@ class SNA_OT_Load_Dose_7629F(bpy.types.Operator, ImportHelper):
             grid.copyFromArray(dose_matrix.astype(float))
 
             # Apply proper DICOM-based transformation matrix
-            print(f"Applying transformation matrix:")
+            print("Applying transformation matrix:")
             print(
                 f"  Scale: [{transform_matrix[0, 0] * 1000:.3f}, {transform_matrix[1, 1] * 1000:.3f}, {transform_matrix[2, 2] * 1000:.3f}] mm/voxel"
             )
@@ -791,7 +670,6 @@ class SNA_OT_Load_Dose_7629F(bpy.types.Operator, ImportHelper):
                     "z_range": coords["z_range"],
                     "image_position": coords["image_position"].tolist(),
                     "pixel_spacing": coords["pixel_spacing"].tolist(),
-                    "modality": spatial_info["modality"],
                 }
 
                 print(f"Set dose volume position: {volume_position} m")
@@ -813,17 +691,15 @@ class SNA_OT_Load_Dose_7629F(bpy.types.Operator, ImportHelper):
 
         # Apply material with unique name and ensure proper display settings
         actual_material_name = apply_DICOM_shader(unique_material_name)
-        ensure_volume_display_settings()
-        verify_volume_material(actual_material_name)
-        optimize_volume_visibility()
 
         # Update dose material thresholds with actual dose values using the actual material name (handles truncation)
         if bpy.context.active_object and bpy.context.active_object.type == "VOLUME":
             dose_obj = bpy.context.active_object
-            if "dose_min" in dose_obj and "dose_max" in dose_obj:
-                update_dose_material_thresholds(
-                    dose_obj["dose_min"], dose_obj["dose_max"], actual_material_name
-                )
+            update_dose_material_thresholds(
+                np.percentile(dose_matrix, 95),
+                np.percentile(dose_matrix, 99.9),
+                actual_material_name,
+            )
 
         return {"FINISHED"}
 
@@ -968,16 +844,12 @@ class SNA_OT_Load_Structures_5Ebc9(bpy.types.Operator, ImportHelper):
                         "z_range": ct_coords["z_range"],
                         "image_position": ct_coords["image_position"].tolist(),
                         "pixel_spacing": ct_coords["pixel_spacing"].tolist(),
-                        "modality": "RTSTRUCT",
                     }
 
                 print(f"Set structure volume position: {volume_position} m")
 
             # Apply material and ensure proper display settings
             apply_DICOM_shader("Structure Material")
-            ensure_volume_display_settings()
-            verify_volume_material("Structure Material")
-            optimize_volume_visibility()
 
         return {"FINISHED"}
 
