@@ -581,7 +581,6 @@ class SNA_OT_Load_Dose_7629F(bpy.types.Operator, ImportHelper):
             pixel_data = ds.pixel_array
             # Convert from DICOM (z, y, x) to OpenVDB (x, y, z) format
             pixel_data = np.transpose(pixel_data, (2, 1, 0))  # (z, y, x) -> (x, y, z)
-            pixel_data = np.flip(pixel_data, axis=0)
             pixel_data = np.ascontiguousarray(pixel_data)
 
             # Get Dose Grid Scaling (3004,000E) - crucial for correct dose values
@@ -606,12 +605,8 @@ class SNA_OT_Load_Dose_7629F(bpy.types.Operator, ImportHelper):
             transform_matrix = create_blender_transform_matrix(coords)
             volume_position = calculate_volume_position_blender(coords)
 
-            # Converts list to numpy array and apply dose grid scaling
-            dose_matrix = np.asarray(pixel_data, dtype=float)
-            dose_matrix = np.flipud(dose_matrix)
-
             # Apply DICOM Dose Grid Scaling to get actual dose values in Gy
-            dose_matrix = dose_matrix * dose_grid_scaling
+            dose_matrix = pixel_data * dose_grid_scaling
 
             print(f"Raw pixel range: {pixel_data.min()} to {pixel_data.max()}")
             print(
