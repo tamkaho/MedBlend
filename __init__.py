@@ -342,8 +342,11 @@ class SNA_OT_Load_Ct_Fc7B9(bpy.types.Operator, ImportHelper):
                 ct_volume.append(sorted_images[i].pixel_array)
 
             ct_volume = np.asarray(ct_volume)
-            ct_volume = np.rot90(ct_volume, k=-1, axes=(2, 1))
-            ct_volume = np.ascontiguousarray(np.transpose(ct_volume, (1, 2, 0)))
+            # Convert from (slices, rows, cols) to OpenVDB (cols, rows, slices) format
+            ct_volume = np.transpose(
+                ct_volume, (2, 1, 0)
+            )  # (slices, rows, cols) -> (cols, rows, slices)
+            ct_volume = np.ascontiguousarray(ct_volume)
 
             print("=== Calculating proper DICOM spatial transformation ===")
 
@@ -576,7 +579,9 @@ class SNA_OT_Load_Dose_7629F(bpy.types.Operator, ImportHelper):
         if is_dose_file(ds):
             # Get the Dose Grid
             pixel_data = ds.pixel_array
-            pixel_data = np.rot90(pixel_data, k=-1, axes=(0, 2))
+            # Convert from DICOM (z, y, x) to OpenVDB (x, y, z) format
+            pixel_data = np.transpose(pixel_data, (2, 1, 0))  # (z, y, x) -> (x, y, z)
+            pixel_data = np.flip(pixel_data, axis=0)
             pixel_data = np.ascontiguousarray(pixel_data)
 
             # Get Dose Grid Scaling (3004,000E) - crucial for correct dose values
@@ -794,8 +799,9 @@ class SNA_OT_Load_Structures_5Ebc9(bpy.types.Operator, ImportHelper):
 
         for i in range(0, len(struct_masks)):
             numpy_image = sitk.GetArrayFromImage(struct_masks[i])
-            numpy_image = np.rot90(numpy_image, k=-1, axes=(2, 1))
-            numpy_image = np.ascontiguousarray(np.transpose(numpy_image, (1, 2, 0)))
+            # Convert from SimpleITK (z, y, x) to OpenVDB (x, y, z) format
+            numpy_image = np.transpose(numpy_image, (2, 1, 0))  # (z, y, x) -> (x, y, z)
+            numpy_image = np.ascontiguousarray(numpy_image)
 
             print("Structure Name:", struct_names[i])
             print("Structure Shape:", np.shape(numpy_image))
