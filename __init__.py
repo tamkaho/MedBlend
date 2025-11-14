@@ -246,6 +246,11 @@ def show_message_box(message="", title="Message Box", icon="INFO"):
 
 addon_keymaps = {}
 _icons = None
+# Global state for structure loading with directory picker
+_medblend_pending_struct_data = {
+    "structure_path": None,
+    "ct_directory": None,
+}
 
 
 class SNA_PT_MEDBLEND_70A7C(bpy.types.Panel):
@@ -705,6 +710,245 @@ class SNA_OT_Load_Dose_7629F(bpy.types.Operator, ImportHelper):
 
 
 # Class to load DICOM Structure files as volumes
+# Modal operator to let user select CT directory when automatic detection fails
+class SNA_OT_Browse_CT_Directory_Beeaa(bpy.types.Operator):
+    """Browse and select CT/MR DICOM directory"""
+
+    bl_idname = "medblend.browse_ct_directory"
+    bl_label = "Browse CT/MR Directory"
+    bl_description = "Select a directory containing CT/MR DICOM images"
+
+    # File browser properties
+    directory: bpy.props.StringProperty(
+        subtype="DIR_PATH",
+        options={"HIDDEN"},
+    )
+
+    def execute(self, context):
+        """User selected a directory - now continue loading with it"""
+        from pathlib import Path
+
+        selected_dir = Path(self.directory)
+
+        # Validate that selected directory contains DICOM files
+        dcm_files = list(selected_dir.glob("*.dcm"))
+        if not dcm_files:
+            show_message_box(
+                f"No DICOM files found in: {self.directory}\n\nPlease select a directory containing DICOM files.",
+                "No DICOM Files",
+                "ERROR",
+            )
+            return {"CANCELLED"}
+
+        print(f"Selected CT/MR directory: {self.directory}")
+        print(f"Found {len(dcm_files)} DICOM files")
+
+        # Store the selected directory in global state so continuation operator can use it
+        global _medblend_pending_struct_data
+        _medblend_pending_struct_data["ct_directory"] = self.directory
+
+        # Retrieve the structure path that was stored before opening file picker
+        structure_path = _medblend_pending_struct_data.get("structure_path")
+        if not structure_path:
+            show_message_box(
+                "Error: Structure path was lost. Please try loading structures again.",
+                "Error",
+                "ERROR",
+            )
+            return {"CANCELLED"}
+
+        print(f"Resuming load with structure: {structure_path}")
+        print(f"Using CT directory: {self.directory}")
+
+        # Invoke the continuation operator to load structures with the selected directory
+        bpy.ops.medblend.load_structures_continue(
+            "EXEC_DEFAULT", struct_filepath=structure_path, ct_dirpath=self.directory
+        )
+
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        """Open directory browser"""
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+
+# Continuation operator that completes structure loading with user-selected CT directory
+class SNA_OT_Load_Structures_Continue_7F2c3(bpy.types.Operator):
+    """Continue loading structures with the selected CT directory"""
+
+    bl_idname = "medblend.load_structures_continue"
+    bl_label = "Continue Loading Structures"
+    bl_description = (
+        "Internal operator to continue loading after CT directory selection"
+    )
+    bl_options = {"REGISTER"}
+
+    # Properties to receive paths from the directory picker
+    struct_filepath: bpy.props.StringProperty(
+        name="Structure File Path",
+        description="Path to the RT structure file",
+    )
+    ct_dirpath: bpy.props.StringProperty(
+        name="CT Directory Path",
+        description="Path to the CT/MR directory",
+    )
+
+    def execute(self, context):
+        """Continue loading structures with the user-selected CT directory"""
+        from pathlib import Path
+
+        # Use the provided paths from the directory picker
+        structure_path = self.struct_filepath
+        ct_directory_path = Path(self.ct_dirpath)
+        structure_file_path = Path(structure_path)
+        structure_directory = structure_file_path.parent
+
+        print(f"Continuing structure load...")
+        print(f"Structure path: {structure_path}")
+        print(f"CT directory path: {ct_directory_path}")
+
+        # Verify the CT directory has DICOM files
+        dcm_files = list(ct_directory_path.glob("*.dcm"))
+        if not dcm_files:
+            show_message_box(
+                f"Error: No DICOM files found in selected directory: {ct_directory_path}",
+                "No DICOM Files",
+                "ERROR",
+            )
+            return {"CANCELLED"}
+
+        # Now proceed with the actual loading using the selected CT directory
+        directory_path = ct_directory_path
+
+        try:
+            DICOM_IMAGE = read_dicom_image(directory_path)
+            voxel_resolution = DICOM_IMAGE.GetSpacing()
+            origin = DICOM_IMAGE.GetOrigin()
+        except Exception as e:
+            print(f"Error reading DICOM image from {directory_path}: {e}")
+            show_message_box(
+                f"Error reading CT images from selected directory: {directory_path}. Please check the file structure.",
+                "DICOM Reading Error",
+                "ERROR",
+            )
+            return {"CANCELLED"}
+
+        # Read the structure file
+        try:
+            dicom_structure = pydicom.dcmread(structure_path)
+        except Exception as e:
+            print(f"Error reading structure file: {e}")
+            show_message_box(
+                "Error reading structure file. Please check the file and try again.",
+                "Error",
+                "ERROR",
+            )
+            return {"CANCELLED"}
+
+        # Transform structure data
+        try:
+            struct_masks, struct_names = transform_point_set_from_dicom_struct(
+                DICOM_IMAGE, dicom_structure
+            )
+        except Exception as e:
+            print(f"Error transforming structure data: {e}")
+            show_message_box(
+                "Something is wrong with the structure file. Please check the file and try again.",
+                "Error",
+                "ERROR",
+            )
+            return {"CANCELLED"}
+
+        # Get spatial info for proper transformation alignment
+        print("=== Calculating proper DICOM structure spatial transformation ===")
+
+        ct_files = list(directory_path.glob("*.dcm"))
+        if ct_files:
+            sample_ct = pydicom.dcmread(ct_files[0])
+            ct_spatial_info = get_dicom_spatial_info(sample_ct)
+            ct_spatial_info["image_position"] = np.array(DICOM_IMAGE.GetOrigin())
+            ct_volume_shape = DICOM_IMAGE.GetSize()
+
+            # Calculate coordinate system for CT
+            ct_coords = calculate_volume_coordinates(ct_spatial_info, ct_volume_shape)
+        else:
+            print("Warning: Could not find CT files for spatial verification")
+            ct_coords = None
+
+        # Create transformation matrix that matches the CT coordinate system
+        transform_matrix = create_blender_transform_matrix(ct_coords)
+        volume_position = calculate_volume_position_blender(ct_coords)
+
+        # Load structures into Blender
+        for i in range(0, len(struct_masks)):
+            numpy_image = sitk.GetArrayFromImage(struct_masks[i])
+            # Convert from SimpleITK (z, y, x) to OpenVDB (x, y, z) format
+            numpy_image = np.transpose(numpy_image, (2, 1, 0))  # (z, y, x) -> (x, y, z)
+            numpy_image = np.ascontiguousarray(numpy_image)
+
+            print("Structure Name:", struct_names[i])
+            print("Structure Shape:", np.shape(numpy_image))
+            print("Structure Voxel Resolution:", voxel_resolution)
+            print("Structure Origin:", origin)
+
+            # Creates a grid of Double precision
+            grid = openvdb.FloatGrid()
+            # Copies image volume from numpy to VDB grid
+            grid.copyFromArray(numpy_image.astype(float))
+
+            print(
+                f"Using DICOM-aligned transformation for structure: {struct_names[i]}"
+            )
+            print(
+                f"  Transform scale: [{transform_matrix[0, 0] * 1000:.3f}, {transform_matrix[1, 1] * 1000:.3f}, {transform_matrix[2, 2] * 1000:.3f}] mm/voxel"
+            )
+
+            # Convert numpy array to OpenVDB-compatible format (4x4 matrix)
+            vdb_transform = openvdb.createLinearTransform(transform_matrix.tolist())
+            grid.transform = vdb_transform
+
+            # Sets the grid class to FOG_VOLUME
+            grid.gridClass = openvdb.GridClass.FOG_VOLUME
+            # Blender needs grid name to be "density"
+            grid.name = "density"
+
+            struct_dir = structure_directory.joinpath(f"{struct_names[i]}.vdb")
+            # Writes CT volume to a vdb file but perhaps this could be done internally in the future
+            openvdb.write(str(struct_dir), grid)
+
+            # Add the volume to the scene
+            bpy.ops.object.volume_import(filepath=str(struct_dir), files=[])
+
+            # Set the volume's position using proper DICOM positioning
+            if bpy.context.active_object and bpy.context.active_object.type == "VOLUME":
+                struct_obj = bpy.context.active_object
+                struct_obj.location = volume_position
+
+                # Store spatial metadata if we have CT coords
+                if ct_coords is not None:
+                    struct_obj["spatial_coords"] = {
+                        "x_range": ct_coords["x_range"],
+                        "y_range": ct_coords["y_range"],
+                        "z_range": ct_coords["z_range"],
+                        "image_position": ct_coords["image_position"].tolist(),
+                        "pixel_spacing": ct_coords["pixel_spacing"].tolist(),
+                    }
+
+                print(f"Set structure volume position: {volume_position} m")
+
+            # Apply material and ensure proper display settings
+            apply_DICOM_shader("Structure Material")
+
+        show_message_box(
+            f"Successfully loaded {len(struct_names)} structure(s)!",
+            "Load Complete",
+            "INFO",
+        )
+
+        return {"FINISHED"}
+
+
 class SNA_OT_Load_Structures_5Ebc9(bpy.types.Operator, ImportHelper):
     bl_idname = "medblend.load_structures"
     bl_label = "Load Structures"
@@ -737,7 +981,7 @@ class SNA_OT_Load_Structures_5Ebc9(bpy.types.Operator, ImportHelper):
             print(f"Using Monaco CT directory: {monaco_ct_dir}")
             directory_path = Path(monaco_ct_dir)
         else:
-            print(f"Using default directory (same as RT struct): {directory_path}")
+            print(f"CT directory not automatically detected")
 
         print(f"Structure path: {structure_path}")
         print(f"CT directory path: {directory_path}")
@@ -748,12 +992,28 @@ class SNA_OT_Load_Structures_5Ebc9(bpy.types.Operator, ImportHelper):
             origin = DICOM_IMAGE.GetOrigin()
         except Exception as e:
             print(f"Error reading DICOM image from {directory_path}: {e}")
-            show_message_box(
-                f"Error reading CT images from directory: {directory_path}. Please check the file structure.",
-                "DICOM Reading Error",
-                "ERROR",
-            )
-            return {"CANCELLED"}
+
+            # If automatic detection failed, ask user to manually select CT directory
+            if not monaco_ct_dir:
+                # Store the structure path in global state so directory picker can pass it to continuation operator
+                global _medblend_pending_struct_data
+                _medblend_pending_struct_data["structure_path"] = structure_path
+
+                show_message_box(
+                    "CT/MR directory could not be found automatically.\n\nPlease select the directory containing CT/MR DICOM images in the file browser that will open.",
+                    "CT/MR Directory Not Found",
+                    "INFO",
+                )
+                # Open directory browser for user to select CT/MR directory
+                bpy.ops.medblend.browse_ct_directory("INVOKE_DEFAULT")
+                return {"CANCELLED"}
+            else:
+                show_message_box(
+                    f"Error reading CT images from directory: {directory_path}. Please check the file structure.",
+                    "DICOM Reading Error",
+                    "ERROR",
+                )
+                return {"CANCELLED"}
 
         dicom_structure = pydicom.dcmread(structure_path)
 
@@ -862,6 +1122,8 @@ def register():
     bpy.utils.register_class(SNA_OT_Load_Ct_Fc7B9)
     bpy.utils.register_class(SNA_OT_Load_Proton_1Dbc6)
     bpy.utils.register_class(SNA_OT_Load_Dose_7629F)
+    bpy.utils.register_class(SNA_OT_Browse_CT_Directory_Beeaa)
+    bpy.utils.register_class(SNA_OT_Load_Structures_Continue_7F2c3)
     bpy.utils.register_class(SNA_OT_Load_Structures_5Ebc9)
 
 
@@ -877,6 +1139,8 @@ def unregister():
     bpy.utils.unregister_class(SNA_OT_Load_Ct_Fc7B9)
     bpy.utils.unregister_class(SNA_OT_Load_Proton_1Dbc6)
     bpy.utils.unregister_class(SNA_OT_Load_Dose_7629F)
+    bpy.utils.unregister_class(SNA_OT_Browse_CT_Directory_Beeaa)
+    bpy.utils.unregister_class(SNA_OT_Load_Structures_Continue_7F2c3)
     bpy.utils.unregister_class(SNA_OT_Load_Structures_5Ebc9)
 
 
