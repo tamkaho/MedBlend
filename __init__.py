@@ -339,11 +339,12 @@ class SNA_OT_Load_Ct_Fc7B9(bpy.types.Operator, ImportHelper):
             # Filter out only those DICOM CT images that have your specified series UID using filter_by_series_uid function
             filtered_images = filter_by_series_uid(images, series_uid)
 
-            # Sort those filtered DICOM CT slices by their instance number using sort_by_instance_number function
-            sorted_images = sort_by_instance_number(filtered_images)
+            # Sort slices by Z position (ImagePositionPatient[2]) instead of instance number
+            # This ensures correct spatial ordering regardless of acquisition direction
+            sorted_images = sorted(filtered_images, key=lambda x: float(x.ImagePositionPatient[2]))
 
             ct_volume = []
-            for i in range(0, len(images)):
+            for i in range(0, len(sorted_images)):
                 ct_volume.append(sorted_images[i].pixel_array)
 
             ct_volume = np.asarray(ct_volume)
@@ -359,7 +360,7 @@ class SNA_OT_Load_Ct_Fc7B9(bpy.types.Operator, ImportHelper):
             first_ds = sorted_images[0]
             spatial_info = get_dicom_spatial_info(first_ds)
 
-            # Override with actual z positions from all slices
+            # Extract z positions from all slices (already sorted by z position)
             z_positions = []
             for ds in sorted_images:
                 z_pos = float(ds.ImagePositionPatient[2])
@@ -369,8 +370,8 @@ class SNA_OT_Load_Ct_Fc7B9(bpy.types.Operator, ImportHelper):
             pixel_array_shape = ct_volume.shape
             coords = calculate_volume_coordinates(spatial_info, pixel_array_shape)
 
-            # Override Z coordinates with actual slice positions
-            coords["z_coords"] = np.array(sorted(z_positions))
+            # Use actual slice positions for Z coordinates
+            coords["z_coords"] = np.array(z_positions)
             coords["z_range"] = [min(z_positions), max(z_positions)]
 
             # Create Blender transformation matrix
